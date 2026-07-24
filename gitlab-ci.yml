@@ -1,0 +1,108 @@
+# Сборка deb-пакетов g3proxy под Ubuntu 22.04 и 24.04.
+#
+# Порт исходного CircleCI-пайплайна (.circleci/config.yml), но:
+#   * только Ubuntu 22.04 / 24.04 (без Debian/RPM);
+#   * без публикации — готовые .deb остаются артефактами pipeline (dist/).
+#
+# Архитектура (как в оригинале):
+#   1) build_tarball  — один раз собирает вендоренный source-tarball
+#      (cargo vendor + prune workspace + capnp codegen + sphinx docs).
+#   2) build_deb      — из этого tarball'а офлайн собирает .deb под каждый релиз.
+#
+# Почему rustup, а не системный rustc: проекту нужен Rust 1.90 (edition 2024),
+# в Ubuntu он старее. Почему tarball: debian/rules собирает с --frozen (офлайн),
+# поэтому все зависимости должны быть вендорены заранее.
+
+stages:
+  - tarball
+  - deb
+
+variables:
+  PACKAGE: g3proxy
+  RUST_VERSION: "1.90.0"
+  DEBIAN_FRONTEND: noninteractive
+  CARGO_TERM_COLOR: "never"
+  GIT_DEPTH: "50"
+  # минимальные ubuntu-образы без сгенерированных локалей — sphinx-build падает
+  # на locale.setlocale(); C.UTF-8 доступна всегда и не требует locale-gen
+  LANG: "C.UTF-8"
+  LC_ALL: "C.UTF-8"
+
+# ---------------------------------------------------------------------------
+# Шаг 1. Вендоренный source-tarball (общий для всех целевых дистрибутивов).
+# ---------------------------------------------------------------------------
+build_tarball:
+  stage: tarball
+  image: ubuntu:24.04
+  variables:
+    # build_tarball.sh пропускает `cargo cache --autoclean`, если задано
+    NO_CARGO_CACHE_CLEAN: "yes"
+  before_script:
+    - apt-get update -qq
+    - >
+      apt-get install -y -qq --no-install-recommends
+      build-essential pkg-config capnproto cmake jq xz-utils git ca-certificates curl
+      dpkg-dev
+      python3 python3-toml python3-sphinx python3-sphinx-rtd-theme
+    - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+    - . "$HOME/.cargo/env"
+    - rustc --version && cargo --version
+  script:
+    - . "$HOME/.cargo/env"
+    # версию берём из debian/changelog — она же станет версией пакета
+    - VERSION=$(dpkg-parsechangelog -l "$PACKAGE/debian/changelog" -S Version | sed 's/-[^-]*$//')
+    - echo "Building source tarball for $PACKAGE v$VERSION at $CI_COMMIT_SHORT_SHA"
+    - ./scripts/release/build_tarball.sh "$PACKAGE-v$VERSION" "$CI_COMMIT_SHA"
+    - ls -lh "$PACKAGE"-*.tar.xz
+  artifacts:
+    name: "$PACKAGE-source-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - g3proxy-*.tar.xz
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# Шаг 2. Офлайн-сборка .deb из tarball'а, по релизу на job.
+# ---------------------------------------------------------------------------
+.build_deb:
+  stage: deb
+  needs:
+    - build_tarball
+  before_script:
+    - apt-get update -qq
+    - >
+      apt-get install -y -qq --no-install-recommends
+      build-essential dpkg-dev debhelper fakeroot lsb-release
+      pkg-config cmake capnproto libssl-dev libc-ares-dev liblua5.4-dev python3-dev
+      curl ca-certificates
+    - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+    - . "$HOME/.cargo/env"
+    - rustc --version
+  script:
+    - . "$HOME/.cargo/env"
+    # распаковываем и собираем внутри дерева tarball'а (там вендоренные зависимости)
+    - tar xf g3proxy-*.tar.xz
+    - cd g3proxy-*/
+    - ./scripts/build_deb_from_tar.sh
+    - cd ..
+    # dpkg-buildpackage кладёт .deb рядом с распакованным деревом
+    - mkdir -p "dist/$UBUNTU_CODENAME"
+    - mv g3proxy_*.deb "dist/$UBUNTU_CODENAME/"
+    - ls -lh "dist/$UBUNTU_CODENAME/"
+    - dpkg-deb -I "dist/$UBUNTU_CODENAME"/*.deb
+  artifacts:
+    name: "$PACKAGE-$UBUNTU_CODENAME-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/
+    expire_in: 30 days
+
+deb:ubuntu-22.04:
+  extends: .build_deb
+  image: ubuntu:22.04
+  variables:
+    UBUNTU_CODENAME: jammy
+
+deb:ubuntu-24.04:
+  extends: .build_deb
+  image: ubuntu:24.04
+  variables:
+    UBUNTU_CODENAME: noble
