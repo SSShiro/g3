@@ -66,6 +66,14 @@ For *map* value, the keys are:
 
   **default**: enabled with default value
 
+* tcp_connect_timeout
+
+  **optional**, **type**: :ref:`humanize duration <conf_value_humanize_duration>`
+
+  TCP connection timeout configuration for establishing connection to the ICAP server.
+
+  **default**: 1s
+
 * icap_connection_pool
 
   **optional**, **type**: :ref:`connection pool <conf_value_connection_pool_config>`
